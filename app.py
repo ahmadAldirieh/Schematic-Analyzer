@@ -1,24 +1,23 @@
 import os
 import base64
 from flask import Flask, request, jsonify, render_template
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from PIL import Image
 import io
+import json
+import google.generativeai as genai
 
 load_dotenv()
 
 app = Flask(__name__)
-client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+model = genai.GenerativeModel("gemini-1.5-flash")
 
 MAX_SIZE_MB = 5
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "webp", "bmp"}
 
 def allowed_file(filename):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
-
-def encode_image(file_bytes, media_type):
-    return base64.standard_b64encode(file_bytes).decode("utf-8")
 
 @app.route("/")
 def index():
@@ -38,11 +37,6 @@ def analyze():
         return jsonify({"error": f"File too large. Max size is {MAX_SIZE_MB}MB."}), 400
 
     ext = file.filename.rsplit(".", 1)[1].lower()
-    media_type_map = {
-        "jpg": "image/jpeg", "jpeg": "image/jpeg",
-        "png": "image/png", "gif": "image/gif",
-        "webp": "image/webp", "bmp": "image/png"
-    }
 
     # Convert BMP to PNG if needed
     if ext == "bmp":
@@ -51,15 +45,14 @@ def analyze():
         img.save(buf, format="PNG")
         file_bytes = buf.getvalue()
 
-    media_type = media_type_map.get(ext, "image/png")
-    image_data = encode_image(file_bytes, media_type)
+    pil_image = Image.open(io.BytesIO(file_bytes))
 
     prompt = """Analyze this electronic schematic image and extract all components and their values.
 
 Return a JSON object with this exact structure:
 {
   "components": [
-    {"type": "Resistor", "label": "R1", "value": "10kΩ"},
+    {"type": "Resistor", "label": "R1", "value": "10kOhm"},
     {"type": "Capacitor", "label": "C1", "value": "100nF"},
     ...
   ],
@@ -71,38 +64,20 @@ Rules:
 - Include every component you can identify (resistors, capacitors, inductors, ICs, transistors, diodes, connectors, voltage sources, etc.)
 - Use the label from the schematic if visible (R1, C2, U1, etc.)
 - Use the value from the schematic if visible, otherwise write "Not labeled"
-- Return ONLY valid JSON, no extra text."""
+- Return ONLY valid JSON, no extra text, no markdown fences."""
 
     try:
-        response = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=2000,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": image_data,
-                            },
-                        },
-                        {"type": "text", "text": prompt}
-                    ],
-                }
-            ],
-        )
+        response = model.generate_content([prompt, pil_image])
+        result_text = response.text.strip()
 
-        import json
-        result_text = response.content[0].text.strip()
         # Strip markdown code fences if present
         if result_text.startswith("```"):
             result_text = result_text.split("```")[1]
             if result_text.startswith("json"):
                 result_text = result_text[4:]
-        result = json.loads(result_text.strip())
+        result_text = result_text.strip()
+
+        result = json.loads(result_text)
         return jsonify({"success": True, "data": result})
 
     except json.JSONDecodeError:
